@@ -1,112 +1,222 @@
-CQDG denovo pipelines
-======
-Introduction
-------
-🚧 WIP : this pipeline recombine gvcf for family's samples in order to facilitate denovo identification.
+# CQDG De Novo Variant Pipeline
 
-(Include Damien's workflow schema?)
+A reusable **Nextflow DSL2 workflow** for processing family-level gVCF data to support downstream **de novo variant identification**.
 
-Usage
------
-### Samples
-The workflow will accept sample data in two format (called V1 and V2). The path to the sample file must be specified with the "**sampleFile**" parameter.
+The pipeline groups gVCFs by family, performs joint genotyping, applies sequencing-type-specific variant quality filtering, normalizes variants, and annotates the resulting VCFs with Ensembl VEP.
 
-1.  The first format is used by default and looks as follows:
+> **Scope:** this workflow prepares and annotates family-level variant data. It does not itself determine inheritance or call de novo variants.
 
-**sampleV1.tsv**
+## Workflow overview
 
-_FAMILY_ID_ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; _Patient1_File_&nbsp; &nbsp; &nbsp;&nbsp; &nbsp;_Patient2_File_&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;_Patient3_File_
-```tsv
-CONGE-XXX       CONGE-XXX-01.hard-filtered.gvcf.gz   CONGE-XXX-02.hard-filtered.gvcf.gz   CONGE-XXX-03.hard-filtered.gvcf.gz
-CONGE-YYY       CONGE-YYY-01.hard-filtered.gvcf.gz   CONGE-YYY-02.hard-filtered.gvcf.gz   CONGE-YYY-03.hard-filtered.gvcf.gz
+```text
+Family gVCFs
+    │
+    ├─ Exclude MNP-like records / normalize input
+    │
+    ├─ Group samples by family
+    │
+    ├─ GATK CombineGVCFs
+    │
+    ├─ GATK GenotypeGVCFs
+    │
+    ├─ Variant quality filtering
+    │      ├─ WGS → VQSR
+    │      └─ WES → hard filtering
+    │
+    ├─ Split multiallelic variants / normalize
+    │
+    ├─ Ensembl VEP annotation
+    │
+    └─ bgzip-compressed VCF + tabix index
 ```
 
-2.  The second format is used in older data and includes the sequencing type (WGS or WES)
+## Main tools
 
-**sampleV2.tsv**
+The workflow is implemented in **Nextflow DSL2** and uses containerized versions of:
 
-_FAMILY_ID_ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; _SEQUENCING_TYPE_ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;_Patient1_File_&nbsp; &nbsp; &nbsp;&nbsp; &nbsp;_Patient2_File_&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;_Patient3_File_
-```tsv
-CONGE-XXX       WES       CONGE-XXX-01.hard-filtered.gvcf.gz   CONGE-XXX-02.hard-filtered.gvcf.gz   CONGE-XXX-03.hard-filtered.gvcf.gz
-CONGE-YYY       WES       CONGE-YYY-01.hard-filtered.gvcf.gz   CONGE-YYY-02.hard-filtered.gvcf.gz   CONGE-YYY-03.hard-filtered.gvcf.gz
+- **GATK 4.5.0.0** — gVCF combination, joint genotyping, VQSR, and hard filtering
+- **bcftools 1.19** — filtering and multiallelic normalization
+- **Ensembl VEP 111** — functional variant annotation
+- **htslib / tabix 1.19** — VCF indexing
+- **nf-schema 2.0.0** — parameter validation and help output
+
+## Input
+
+### Family sample file
+
+The workflow accepts a tab-delimited sample file through `--sampleFile`. Two formats are supported.
+
+#### V1 — sequencing type supplied globally
+
+```text
+FAMILY_ID    SAMPLE_1_GVCF    SAMPLE_2_GVCF    SAMPLE_3_GVCF
 ```
 
+Example:
 
-The file format can be chosen with the "**sampleFileFormat**" parameter (either "V1" or "V2", default "V1"). Note that both types are tab-delimited (.tsv)
+```tsv
+FAMILY-001	/path/FAMILY-001-01.g.vcf.gz	/path/FAMILY-001-02.g.vcf.gz	/path/FAMILY-001-03.g.vcf.gz
+FAMILY-002	/path/FAMILY-002-01.g.vcf.gz	/path/FAMILY-002-02.g.vcf.gz	/path/FAMILY-002-03.g.vcf.gz
+```
 
-Next, if the file format is "V1", the sequencing type can be specified with the "**sequencingType**" parameter (either "WGS" for Whole Genome Sequencing or "WES" for Whole Exome Sequencing, default "WGS")
+Use:
 
-> [!NOTE]
-> The sequencing type also determines the type of variant filtering the pipeline will use.
-> 
-> In the case of Whole Genome Sequencing, VQSR (Variant Quality Score Recalibration) is used (preferred method).
-> 
-> In the case of Whole Exome Sequencing, Hard-filtering needs to be used.
+```text
+--sampleFileFormat V1
+--sequencingType WGS
+```
 
-### References
-Reference files are necessary at multiple steps of the workflow, notably for joint-genotyping,the variant effect predictor (VEP) and VQSR. 
+`V1` is the default sample-file format and `WGS` is the default sequencing type.
 
-Specifically, we need a reference genome directory and filename specified with the **referenceGenome** and **referenceGenomeFasta** parameters respectively. 
+#### V2 — sequencing type supplied per family
 
-⚠️ _(TO DO: I think these two parameters could be combined, I don't think we use any other file than the Fasta in the referenceGenome directory.)_ ⚠️
+```text
+FAMILY_ID    SEQUENCING_TYPE    SAMPLE_1_GVCF    SAMPLE_2_GVCF    SAMPLE_3_GVCF
+```
 
-Generally, we use the Homo_sapiens_assembly38.fasta as referenceGenome (see Resources)
+Example:
 
+```tsv
+FAMILY-001	WES	/path/FAMILY-001-01.g.vcf.gz	/path/FAMILY-001-02.g.vcf.gz	/path/FAMILY-001-03.g.vcf.gz
+FAMILY-002	WGS	/path/FAMILY-002-01.g.vcf.gz	/path/FAMILY-002-02.g.vcf.gz	/path/FAMILY-002-03.g.vcf.gz
+```
 
+Use:
 
-Next, we also need broader references, which are contained in a path defined by the **broad** parameter.
+```text
+--sampleFileFormat V2
+```
 
-The broad directory must contain the following files:
+For each gVCF path, the workflow also expects the corresponding index to be available alongside the file.
 
-- The interval list which determines the genomic interval(s) over which we operate: filename of this list must be defined with the **intervalsFile** parameter
-- Highly validated variance ressources currently required by VQSR. ***These are currently hard coded in the pipeline!***
-  - HapMap file : hapmap_3.3.hg38.vcf.gz
-  - 1000G omni2.5 file : 1000G_omni2.5.hg38.vcf.gz
-  - 1000G reference file : 1000G_phase1.snps.high_confidence.hg38.vcf.gz
-  - SNP database : Homo_sapiens_assembly38.dbsnp138.vcf.gz
+## WGS vs WES filtering
 
- 
-Finally, the vep cache directory must be specified with **vepCache**, which is usually created by vep itself on first installation.
-Generally, we only need the human files obtainable from https://ftp.ensembl.org/pub/release-112/variation/vep/homo_sapiens_vep_112_GRCh38.tar.gz
+The filtering path depends on sequencing type:
 
-### Stub run
-The -stub-run option can be added to run the "stub" block of processes instead of the "script" block. This can be helpful for testing.
+- **WGS:** Variant Quality Score Recalibration (**VQSR**)
+- **WES:** configurable **hard filtering**
 
-🚧
+The default hard-filter expressions are defined in `nextflow.config` and can be overridden through the `hardFilters` parameter.
 
-Parameters summary
------
+## Reference resources
 
-| Parameter name | Required? | Accepted input |
+The workflow requires the following reference inputs.
+
+### Reference genome
+
+- `referenceGenome` — directory containing the reference genome files
+- `referenceGenomeFasta` — reference FASTA filename within that directory
+
+The workflow was developed around **GRCh38** resources.
+
+### Broad/GATK resources
+
+- `broad` — directory containing the interval list and VQSR resources
+- `intervalsFile` — interval-list filename within that directory
+
+The current VQSR implementation expects the following resource filenames in the configured Broad resource directory:
+
+- `hapmap_3.3.hg38.vcf.gz`
+- `1000G_omni2.5.hg38.vcf.gz`
+- `1000G_phase1.snps.high_confidence.hg38.vcf.gz`
+- `Homo_sapiens_assembly38.dbsnp138.vcf.gz`
+
+These filenames are currently part of the workflow assumptions and should be considered when preparing a reusable installation.
+
+### VEP cache
+
+- `vepCache` — directory containing an Ensembl VEP cache compatible with the configured VEP container and GRCh38 reference
+
+VEP is run in **offline/cache mode**.
+
+## Required parameters
+
+| Parameter | Required | Description |
 | --- | --- | --- |
-| `sampleFile` | _Required_ | file |
-| `sampleFileFormat` | _Optional_ | `V1` or `V2`, default `V1` |
-| `sequencingType` | _Optional_ | `WGS` or `WES`, default `WGS` |
-| `referenceGenome` | _Required_ | path |
-| `referenceGenomeFasta` | _Required_ | file |
-| `broad` | _Required_ | path |
-| `intervalsFile` | _Required_ | list of genome intervals |
-| `vepCache` | _Required_ | path |
+| `sampleFile` | Yes | Tab-delimited family/sample input file |
+| `outputDir` | Yes | Output directory |
+| `referenceGenome` | Yes | Directory containing the reference genome |
+| `broad` | Yes | Directory containing interval and VQSR resources |
+| `vepCache` | Yes | Ensembl VEP cache directory |
+| `intervalsFile` | Yes | Interval-list filename |
+| `hardFilters` | Yes by schema | Hard-filter definitions used for WES |
+| `sampleFileFormat` | No | `V1` or `V2`; default `V1` |
+| `sequencingType` | No | `WGS` or `WES`; default `WGS` for V1 inputs |
+| `vepCpu` | No | Number of VEP forks; default `4` |
+| `TSfilterSNP` | No | VQSR SNP truth-sensitivity threshold |
+| `TSfilterINDEL` | No | VQSR INDEL truth-sensitivity threshold |
 
-Pipeline Output
------
-🚧
+For the complete parameter schema, see [`nextflow_schema.json`](nextflow_schema.json).
 
-Resources
------
-The documentation of the various tools used in this workflow are available here:
+## Running the workflow
 
-[Nextflow](https://www.nextflow.io/docs/latest/index.html)
+Display parameter help with:
 
-[bcftools](https://samtools.github.io/bcftools/bcftools.html)
+```bash
+nextflow run main.nf --help
+```
 
-**GATK**:
-- [CombineGVCFs](https://gatk.broadinstitute.org/hc/en-us/articles/360037593911-CombineGVCFs)
-- [GenotypeGVCFs](https://gatk.broadinstitute.org/hc/en-us/articles/360037057852-GenotypeGVCFs)
-- [VariantRecalibrator](https://gatk.broadinstitute.org/hc/en-us/articles/360035531612-Variant-Quality-Score-Recalibration-VQSR)
-- [VariantFiltration](https://gatk.broadinstitute.org/hc/enus/articles/360041850471-VariantFiltration))
+A typical run can be configured through a JSON parameter file:
 
-[VEP](https://useast.ensembl.org/info/docs/tools/vep/script/vep_options.html)
+```bash
+nextflow run main.nf -params-file params.json
+```
 
-**Reference files**
-🚧
+A minimal parameter file will need to provide the required paths for the sample file, output directory, reference genome, Broad/GATK resources, VEP cache, interval file, and hard-filter configuration.
+
+## Stub testing
+
+The workflow includes Nextflow `stub` blocks for its processes. This allows the pipeline structure and channel wiring to be exercised without running the full bioinformatics tools:
+
+```bash
+nextflow run main.nf -stub-run -params-file params.json
+```
+
+## Output
+
+Final annotated family-level VCFs are published to `outputDir` with names of the form:
+
+```text
+variants.<FAMILY_ID>.vep.vcf.gz
+variants.<FAMILY_ID>.vep.vcf.gz.tbi
+```
+
+The Nextflow configuration also writes execution metadata under:
+
+```text
+<outputDir>/pipeline_info/
+```
+
+including:
+
+- execution timeline
+- execution report
+- execution trace
+- pipeline DAG
+
+## Reproducibility and execution
+
+Process containers are defined in `nextflow.config`. The workflow also defines per-process CPU, memory, disk, time, retry, and executor settings to support reproducible execution in managed compute environments.
+
+Because reference data are external to the containers, reproducible deployment also depends on using compatible versions of the reference genome, GATK/VQSR resources, interval lists, and VEP cache.
+
+## Current implementation notes
+
+This repository is intended to be reusable, but several assumptions remain specific to the current implementation:
+
+- the workflow is built around GRCh38 resources;
+- several VQSR resource filenames are currently expected by name;
+- `referenceGenome` and `referenceGenomeFasta` are separate parameters;
+- compatibility between the VEP cache, VEP container, and reference FASTA must be maintained by the user.
+
+These are deployment constraints rather than hidden dependencies and are documented here to make reuse easier.
+
+## References
+
+- [Nextflow documentation](https://www.nextflow.io/docs/latest/)
+- [bcftools documentation](https://samtools.github.io/bcftools/bcftools.html)
+- [GATK CombineGVCFs](https://gatk.broadinstitute.org/hc/en-us/articles/360037593911-CombineGVCFs)
+- [GATK GenotypeGVCFs](https://gatk.broadinstitute.org/hc/en-us/articles/360037057852-GenotypeGVCFs)
+- [GATK Variant Quality Score Recalibration](https://gatk.broadinstitute.org/hc/en-us/articles/360035531612-Variant-Quality-Score-Recalibration-VQSR)
+- [GATK VariantFiltration](https://gatk.broadinstitute.org/hc/en-us/articles/360041850471-VariantFiltration)
+- [Ensembl VEP documentation](https://www.ensembl.org/info/docs/tools/vep/index.html)
